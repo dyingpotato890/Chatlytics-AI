@@ -14,7 +14,7 @@ app = FastAPI(
     version = "1.0.0"
 )
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY_1")
 if not GEMINI_API_KEY:
     print("Error: KEY not found")
     
