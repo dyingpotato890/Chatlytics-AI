@@ -1,18 +1,73 @@
+import datetime
 import os
 import re
+import asyncio
+import aiohttp
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, status
+from fastapi import FastAPI, HTTPException, status, BackgroundTasks
 from pydantic import BaseModel
-from typing import List, Dict, Union
+from typing import List
 import google.generativeai as genai
 from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS
+from contextlib import asynccontextmanager
 
 load_dotenv()
 
+# Global variables for keep-alive
+keep_alive_task = None
+app_url = None
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global keep_alive_task, app_url
+    
+    # Try to determine the app URL from environment variables
+    app_url = os.getenv("RENDER_EXTERNAL_URL") or os.getenv("APP_URL")
+    
+    if app_url:
+        print(f"Starting keep-alive service for URL: {app_url}")
+        keep_alive_task = asyncio.create_task(keep_alive_service())
+    else:
+        print("No external URL configured. Keep-alive service disabled.")
+    
+    yield
+    
+    # Shutdown
+    if keep_alive_task:
+        keep_alive_task.cancel()
+        try:
+            await keep_alive_task
+        except asyncio.CancelledError:
+            pass
+
 app = FastAPI(
-    title = "Chat Analyzer API",
-    version = "1.0.0"
+    title="Chat Analyzer API",
+    version="1.0.0",
+    lifespan=lifespan
 )
+
+async def keep_alive_service():
+    while True:
+        try:
+            await asyncio.sleep(14 * 60)
+            
+            if app_url:
+                timeout = aiohttp.ClientTimeout(total=30)  # Fixed: Use ClientTimeout object
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    try:
+                        async with session.get(f"{app_url}/health") as response:
+                            if response.status == 200:
+                                print(f"Keep-alive ping successful at {datetime.datetime.now()}")
+                            else:
+                                print(f"Keep-alive ping failed with status {response.status}")
+                    except Exception as e:
+                        print(f"Keep-alive ping error: {e}")
+        except asyncio.CancelledError:
+            print("Keep-alive service stopped")
+            break
+        except Exception as e:
+            print(f"Keep-alive service error: {e}")
+            await asyncio.sleep(60)
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY_1")
 if not GEMINI_API_KEY:
@@ -36,32 +91,26 @@ class ChatMessages(BaseModel):
     
 stop_words = set(ENGLISH_STOP_WORDS)
 
-def _extract_words_from_text(text: str) -> List[str]:
-    # Tokenize using regex, convert to lowercase
-    words = re.findall(r'\b\w+\b', text.lower())
-
-    # Filter out stopwords and short words
-    filtered_words = [
-        word for word in words
-        if word not in stop_words and len(word) > 2
-    ]
-
-    # Count word frequencies
-    word_counts = {}
-    for word in filtered_words:
-        word_counts[word] = word_counts.get(word, 0) + 1
-
-    # Return top 5 most frequent words
-    sorted_words = sorted(word_counts.items(), key=lambda item: item[1], reverse=True)
-    return [word for word, count in sorted_words[:5]]
-
-
 @app.get("/")
 async def read_root():
-    return {"message": "Chat Analyzer API is running. Go to /docs for API documentation."}
+    return {
+        "message": "Chat Analyzer API is running.",
+        "timestamp": datetime.datetime.now(),
+        "keep_alive_active": keep_alive_task is not None and not keep_alive_task.done(),
+        "app_url": app_url
+    }
+
+@app.get("/wake")
+async def wake_endpoint():
+    return {
+        "message": "Service is awake and ready",
+        "timestamp": datetime.datetime.now(),
+        "gemini_ready": gemini_model is not None,
+        "keep_alive_active": keep_alive_task is not None and not keep_alive_task.done()
+    }
 
 @app.post("/analyze_chat/")
-async def analyze_chat_endpoint(chat_data: ChatMessages):
+async def analyze_chat_endpoint(chat_data: ChatMessages, background_tasks: BackgroundTasks):
     messages = chat_data.messages
     
     if not messages:
@@ -75,6 +124,9 @@ async def analyze_chat_endpoint(chat_data: ChatMessages):
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Gemini model not initialized. Please check API key and server logs."
         )
+
+    # Add a background task to log usage (optional)
+    background_tasks.add_task(log_analysis_usage, len(messages))
 
     chat_dialogue = "\n".join(messages)
     summary = None
@@ -125,111 +177,43 @@ async def analyze_chat_endpoint(chat_data: ChatMessages):
         'wordCount': word_count,
         'avgMessageLength': avg_message_length,
         'error': error_message, # None if successful
-        'model': used_model
+        'model': used_model,
+        'timestamp': datetime.datetime.now()
     }
+
+async def log_analysis_usage(message_count: int):
+    print(f"Analysis completed for {message_count} messages at {datetime.datetime.now()}")
 
 @app.get("/health")
 async def health_check():
-    status_dict = {
+    return {
         "api_status": "running",
-        "gemini_api_key_configured": bool(GEMINI_API_KEY),
-        "gemini_model_loaded": gemini_model is not None
+        "timestamp": datetime.datetime.now(),
+        "gemini_ready": gemini_model is not None,
+        "keep_alive_active": keep_alive_task is not None and not keep_alive_task.done()
     }
-    if not status_dict["gemini_model_loaded"]:
-        status_dict["warning"] = "Gemini model failed to load. Analysis endpoint will fail."
-    return status_dict
 
 @app.get("/test_connection")
 async def test_connection_endpoint():
-    """
-    Test API connection and Gemini model availability without consuming tokens.
-    Uses model configuration checks instead of actual API calls.
-    """
-    test_results = {
-        "api_status": "running",
+    is_ready = bool(GEMINI_API_KEY and gemini_model)
+    
+    return {
+        "timestamp": datetime.datetime.now(),
+        "status": "success" if is_ready else "error",
         "gemini_api_key_configured": bool(GEMINI_API_KEY),
         "gemini_model_loaded": gemini_model is not None,
-        "status": "success",
-        "message": "Connection test completed without consuming tokens"
+        "keep_alive_active": keep_alive_task is not None and not keep_alive_task.done(),
+        "message": "API ready for analysis" if is_ready else "Missing API key or model failed to load"
     }
-    
-    # Check if all prerequisites are met
-    if not GEMINI_API_KEY:
-        test_results["status"] = "error"
-        test_results["message"] = "Gemini API key not configured"
-        test_results["error_details"] = "GEMINI_API_KEY environment variable is missing"
-        return test_results
-    
-    if not gemini_model:
-        test_results["status"] = "error"
-        test_results["message"] = "Gemini model not initialized"
-        test_results["error_details"] = "Model failed to load during startup. Check API key validity and network connection."
-        return test_results
-    
-    # Optional: Test basic model configuration (still no token usage)
-    try:
-        # This just checks if the model object has the expected attributes
-        model_name = gemini_model.model_name if hasattr(gemini_model, 'model_name') else "gemini-1.5-flash"
-        test_results["model_name"] = model_name
-        test_results["message"] = f"API ready. Model '{model_name}' is configured and ready for analysis."
-        
-    except Exception as e:
-        test_results["status"] = "warning"
-        test_results["message"] = "Model configured but may have issues"
-        test_results["warning_details"] = str(e)
-    
-    return test_results
 
-@app.get("/validate_setup")
-async def validate_setup():
-    validation = {
-        "timestamp": "2024-01-01T00:00:00Z",  # You might want to add actual timestamp
-        "checks": {
-            "environment": {
-                "gemini_api_key_exists": bool(os.getenv("GEMINI_API_KEY")),
-                "gemini_api_key_length": len(GEMINI_API_KEY) if GEMINI_API_KEY else 0,
-                "gemini_api_key_format_valid": bool(GEMINI_API_KEY and GEMINI_API_KEY.startswith('AI')),
-            },
-            "api_configuration": {
-                "genai_configured": bool(GEMINI_API_KEY),
-                "model_initialized": gemini_model is not None,
-                "model_type": type(gemini_model).__name__ if gemini_model else None,
-            },
-            "dependencies": {
-                "fastapi_available": True,  # If we're running, FastAPI is available
-                "google_generativeai_available": 'genai' in globals(),
-                "sklearn_available": 'ENGLISH_STOP_WORDS' in globals(),
-                "dotenv_loaded": bool(os.getenv("GEMINI_API_KEY") or os.environ.get("GEMINI_API_KEY")),
-            }
-        },
-        "overall_status": "unknown",
-        "recommendations": []
+@app.get("/status")
+async def get_status():
+    is_ready = bool(GEMINI_API_KEY and gemini_model)
+    return {
+        "timestamp": datetime.datetime.now(),
+        "status": "ready" if is_ready else "not_ready",
+        "gemini_configured": bool(GEMINI_API_KEY),
+        "gemini_ready": gemini_model is not None,
+        "keep_alive_running": keep_alive_task is not None and not keep_alive_task.done(),
+        "message": "All systems operational" if is_ready else "Configuration incomplete"
     }
-    
-    # Determine overall status
-    critical_checks = [
-        validation["checks"]["environment"]["gemini_api_key_exists"],
-        validation["checks"]["api_configuration"]["genai_configured"],
-        validation["checks"]["api_configuration"]["model_initialized"],
-    ]
-    
-    if all(critical_checks):
-        validation["overall_status"] = "ready"
-        validation["message"] = "All systems ready for chat analysis"
-    elif validation["checks"]["environment"]["gemini_api_key_exists"]:
-        validation["overall_status"] = "partial"
-        validation["message"] = "API key present but model initialization failed"
-        validation["recommendations"].append("Check API key validity and network connectivity")
-    else:
-        validation["overall_status"] = "not_ready"
-        validation["message"] = "Missing required configuration"
-        validation["recommendations"].append("Set GEMINI_API_KEY environment variable")
-    
-    # Add specific recommendations based on failed checks
-    if not validation["checks"]["environment"]["gemini_api_key_format_valid"]:
-        validation["recommendations"].append("Verify API key format (should start with 'AI')")
-    
-    if validation["checks"]["environment"]["gemini_api_key_length"] > 0 and validation["checks"]["environment"]["gemini_api_key_length"] < 20:
-        validation["recommendations"].append("API key seems too short, verify it's complete")
-    
-    return validation
