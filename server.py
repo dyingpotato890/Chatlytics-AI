@@ -78,7 +78,7 @@ gemini_model = None
 if GEMINI_API_KEY:
     try:
         genai.configure(api_key=GEMINI_API_KEY) # type: ignore
-        gemini_model = genai.GenerativeModel('gemini-1.5-flash') # type: ignore
+        gemini_model = genai.GenerativeModel('gemini-2.5-flash') # type: ignore
         print("Google Gemini API configured and model loaded.")
     except Exception as e:
         print(f"Error initializing Gemini model: {e}")
